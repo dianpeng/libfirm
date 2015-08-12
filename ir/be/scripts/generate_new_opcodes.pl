@@ -608,6 +608,7 @@ print $out_h <<EOF;
 
 #include "be_types.h"
 #include "irnode_t.h"
+#include "${arch}_nodes_attr.h"
 
 $obst_enum_op
 int is_${arch}_irn(const ir_node *node);

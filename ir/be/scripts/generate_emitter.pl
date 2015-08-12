@@ -91,6 +91,7 @@ my $out_c = create_with_header("$target_dir/gen_${arch}_emitter.c", "Generated f
 print $out_c <<EOF;
 #include "beemitter.h"
 #include "gen_${arch}_emitter.h"
+#include "gen_${arch}_new_nodes.h"
 #include "${arch}_new_nodes.h"
 #include "${arch}_emitter.h"
 
