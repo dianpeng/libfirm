@@ -115,8 +115,6 @@ typedef enum {
 typedef struct {
 	unsigned integer_params;
 	unsigned sse_params;
-	unsigned regs_full;
-	unsigned current_reg_size;
 } amd64_abi_state;
 
 static bool try_free_register(unsigned *r, unsigned max)
@@ -129,11 +127,73 @@ static bool try_free_register(unsigned *r, unsigned max)
 	}
 }
 
+static bool has_unaligned_fields(ir_type *tp)
+{
+	if (is_compound_type(tp)) {
+		unsigned n = get_compound_n_members(tp);
+		for (unsigned i = 0; i < n; i++) {
+			ir_entity *member = get_compound_member(tp, i);
+			ir_type *member_tp = get_entity_type(member);
+			if (get_entity_aligned(member) == align_non_aligned ||
+			    has_unaligned_fields(member_tp)) {
+				return true;
+			}
+		}
+		return false;
+	} else if (is_Array_type(tp)) {
+		return has_unaligned_fields(get_array_element_type(tp));
+	} else {
+		return false;
+	}
+}
+
+static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp);
+
+static bool all_members_sse(amd64_abi_state *s, ir_type *tp, unsigned min_offset, unsigned max_offset)
+{
+	unsigned n = get_compound_n_members(tp);
+	for (unsigned i = 0; i < n; i++) {
+		ir_entity *member = get_compound_member(tp, i);
+		unsigned offset = get_entity_offset(member);
+
+		if (min_offset <= offset && offset < max_offset) {
+			ir_type *member_type = get_entity_type(member);
+			amd64_class member_class = classify_compound_for_amd64(s, member_type);
+			if (member_class != class_sse) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static amd64_class get_eightbyte_class(amd64_abi_state *s, ir_type *tp, unsigned offset)
+{
+	bool      use_sse = all_members_sse(s, tp, offset, offset + 8);
+	unsigned *r;
+	unsigned  max;
+	if (use_sse) {
+		r = &s->sse_params;
+		max = max_sse_params;
+	} else {
+		r = &s->integer_params;
+		max = max_integer_params;
+	}
+	if (try_free_register(r, max)) {
+		return use_sse ? class_sse : class_integer;
+	} else {
+		return class_memory;
+	}
+
+}
+
 /*
- * Note that this is *not* the real thing. Actually, we would have to
- * classify both registers of a struct separately and return two
- * values here. However, this function will return class_integer or
- * class_sse iff the type is passed/returned in one or more registers.
+ * Note that we leave out the cases that the AMD64 backend cannot
+ * handle anyway (long double, vector types).
+ *
+ * Also, if a compound type is stored in two different register
+ * classes, we only return one of them, which is enough for the
+ * purposes of this module.
  */
 static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 {
@@ -146,137 +206,121 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 		panic("classes not supported");
 
 	case tpo_struct: {
-		amd64_abi_state save             = *s;
-		amd64_class     current_class    = class_no_class;
-		unsigned        n                = get_compound_n_members(tp);
-
-		for (unsigned i = 0; i < n; i++) {
-			ir_entity *member      = get_compound_member(tp, i);
-			ir_type   *member_tp   = get_entity_type(member);
-			unsigned   member_size = get_type_size_bytes(member_tp);
-
-			/* Does the type fit in the current register? */
-			s->current_reg_size = round_up2(s->current_reg_size, member_size);
-			s->current_reg_size += member_size;
-			if (s->current_reg_size > 8) {
-				/* Do we have another register to use? */
-				if (s->regs_full == 0) {
-					s->regs_full++;
-					s->current_reg_size = member_size;
-
-					unsigned *r;
-					unsigned  max;
-					if (current_class == class_sse) {
-						r   = &s->sse_params;
-						max = max_sse_params;
-					} else if (current_class == class_integer) {
-						r   = &s->integer_params;
-						max = max_integer_params;
-					}
-					if (!try_free_register(r, max)) {
-						*s = save;
-						return class_memory;
-					}
-				} else {
-					*s = save;
-					return class_memory;
-				}
-			}
-
-			amd64_class member_class = classify_compound_for_amd64(s, member_tp);
-
-			/* See AMD64 ABI, sect. 3.2.3, paragraph
-			 * "Classification", no. 4 */
-			if (current_class == member_class) {
-				continue;
-			} else if (current_class == class_no_class) {
-				current_class = member_class;
-			} else if (member_class == class_no_class) {
-				continue;
-			} else if (member_class == class_memory) {
-				/* Once we arrive here, our class is
-				 * always going to be class_memory. */
-				*s = save;
-				return class_memory;
-			} else if (current_class == class_integer) {
-				continue;
-			} else if (member_class == class_integer) {
-				current_class = class_integer;
-			} else {
-				current_class = class_sse;
-			}
+		/* Rules for structs:
+		 * - No unaligned fields
+		 * - smaller than two eightbytes
+		 * - Enough free registers
+		 */
+		if (has_unaligned_fields(tp)) {
+			return class_memory;
 		}
 
-		return current_class;
+		unsigned        size = get_type_size_bytes(tp);
+		amd64_abi_state save = *s;
+		if (size <= 8) {
+			amd64_class c = get_eightbyte_class(s, tp, 0);
+			if (c == class_memory) {
+				*s = save;
+			}
+			return c;
+		} else if (size <= 16) {
+			amd64_class c1 = get_eightbyte_class(s, tp, 0);
+			amd64_class c2 = get_eightbyte_class(s, tp, 8);
+			if (c1 == class_memory || c2 == class_memory) {
+				*s = save;
+				return class_memory;
+			} else {
+				/* Arbitrary choice */
+				return c1;
+			}
+		} else {
+			*s = save;
+			return class_memory;
+		}
 	}
 
 	case tpo_union: {
-		amd64_abi_state save                = *s;
-		amd64_class     current_class       = class_no_class;
-		unsigned        n                   = get_compound_n_members(tp);
-		amd64_abi_state max_fill            = *s;
+		/* Rules for unions:
+		 * - No unaligned fields
+		 * - All members have register class
+		 * - Enough free registers for the largest member (in each register class)
+		 */
+		if (has_unaligned_fields(tp)) {
+			return class_memory;
+		}
+
+		unsigned        n         = get_compound_n_members(tp);
+		amd64_abi_state max_state = *s;
+		bool            is_sse    = true;
 
 		for (unsigned i = 0; i < n; i++) {
-			ir_entity   *member       = get_compound_member(tp, i);
-			ir_type     *member_tp    = get_entity_type(member);
-			amd64_class  member_class = classify_compound_for_amd64(s, member_tp);
+			ir_entity       *member      = get_compound_member(tp, i);
+			ir_type         *member_type = get_entity_type(member);
+			amd64_abi_state  save        = *s;
+			amd64_class      class       = classify_compound_for_amd64(s, member_type);
 
-			/* See AMD64 ABI, sect. 3.2.3, paragraph
-			 * "Classification", no. 4 */
-			if (current_class == member_class) {
-				continue;
-			} else if (current_class == class_no_class) {
-				current_class = member_class;
-			} else if (member_class == class_no_class) {
-				continue;
-			} else if (member_class == class_memory) {
-				/* Once we arrive here, our class is
-				 * always going to be class_memory. */
+			if (class == class_memory) {
 				*s = save;
 				return class_memory;
-			} else if (current_class == class_integer) {
-				continue;
-			} else if (member_class == class_integer) {
-				current_class = class_integer;
-			} else {
-				current_class = class_sse;
+			}
+			if (class != class_sse) {
+				is_sse = false;
 			}
 
-			max_fill.integer_params   = MAX(max_fill.integer_params,   s->integer_params);
-			max_fill.sse_params       = MAX(max_fill.sse_params,       s->sse_params);
-			max_fill.regs_full        = MAX(max_fill.regs_full,        s->regs_full);
-			max_fill.current_reg_size = MAX(max_fill.current_reg_size, s->current_reg_size);
-			/* Reset registers for next member */
+			max_state.integer_params = MAX(max_state.integer_params, s->integer_params);
+			max_state.sse_params     = MAX(max_state.sse_params,     s->sse_params);
+			/* Reset registers for the next member */
 			*s = save;
 		}
-		*s = max_fill;
 
-		return current_class;
+		return is_sse ? class_sse : class_integer;
 	}
 
 	case tpo_array: {
-		amd64_abi_state  save          = *s;
-		unsigned         n             = get_array_size_int(tp);
-		ir_type         *elem_type     = get_array_element_type(tp);
-		amd64_class      current_class = class_no_class;
+		/* Rules for arrays:
+		 * - No unaligned fields
+		 * - smaller than 2 eightbytes
+		 * - Element type has register class
+		 * - Enough free registers
+		 */
+		if (has_unaligned_fields(tp)) {
+			return class_memory;
+		}
 
-		for (unsigned i = 0; i < n; i++) {
-			amd64_class elem_class = classify_compound_for_amd64(s, elem_type);
+		ir_type  *elem_type = get_array_element_type(tp);
+		unsigned  elem_size = get_type_size_bytes(elem_type);
+		unsigned  arr_size  = get_array_size_int(tp);
+		unsigned  n_bytes   = elem_size * arr_size;
 
-			/* elem_class should at most once change from
-			 * whatever it was before to class_integer.
-			 * This makes the logic a bit easier here. */
-			if (elem_class == class_memory) {
+		if (n_bytes > 16) {
+			return class_memory;
+		}
+
+		amd64_abi_state  save   = *s;
+		unsigned         n_regs = (n_bytes + 7) / 8;
+		bool             is_sse = classify_compound_for_amd64(s, elem_type) == class_sse;
+		unsigned        *r;
+		unsigned         max;
+
+		/* Reset registers because we are going to count them ourselves */
+		*s = save;
+
+		if (is_sse) {
+			r   = &s->sse_params;
+			max = max_sse_params;
+		} else {
+			r   = &s->integer_params;
+			max = max_integer_params;
+		}
+
+		for (unsigned i = 0; i < n_regs; i++) {
+			if (!try_free_register(r, max)) {
 				*s = save;
 				return class_memory;
-			} else if (elem_class == class_integer) {
-				current_class = class_integer;
-			} else if (elem_class == class_sse) {
-				current_class = class_sse;
 			}
 		}
 
-		return current_class;
+		return is_sse ? class_sse : class_integer;
 	}
 
 	case tpo_primitive:
@@ -309,8 +353,6 @@ static amd64_class classify_for_amd64(amd64_abi_state *s, ir_type *tp)
 	case tpo_struct:
 	case tpo_union:
 	case tpo_array:
-		s->regs_full        = 0;
-		s->current_reg_size = 0;
 		return classify_compound_for_amd64(s, tp);
 
 	case tpo_primitive:
