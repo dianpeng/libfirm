@@ -380,6 +380,23 @@ static amd64_class classify_for_amd64(amd64_abi_state *s, ir_type *tp)
 	panic("invalid type");
 }
 
+static void panic_if_amd64_register_type(compound_call_lowering_flags flags, ir_type *tp)
+{
+	if (flags & LF_USE_AMD64_ABI) {
+		/* TODO: Must keep ABI state! */
+		amd64_abi_state s = {
+			.sse_params = 0,
+			.integer_params = 0,
+		};
+
+		amd64_class c = classify_for_amd64(&s, tp);
+
+		if (c == class_integer || c == class_sse) {
+			panic("Small struct return values and parameters not supported");
+		}
+	}
+}
+
 /**
  * Creates a new lowered type for a method type with compound
  * arguments. The new type is associated to the old one and returned.
@@ -400,6 +417,7 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 	for (size_t i = 0; i < n_ress; ++i) {
 		ir_type *res_tp = get_method_res_type(mtp, i);
 		if (is_aggregate_type(res_tp)) {
+			panic_if_amd64_register_type(flags, res_tp);
 			must_be_lowered = true;
 			break;
 		}
@@ -408,6 +426,7 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 		for (size_t i = 0; i < n_params; ++i) {
 			ir_type *param_type = get_method_param_type(mtp, i);
 			if (is_aggregate_type(param_type)) {
+				panic_if_amd64_register_type(flags, param_type);
 				must_be_lowered = true;
 				break;
 			}
