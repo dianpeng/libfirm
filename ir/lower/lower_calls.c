@@ -215,26 +215,26 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 			return class_memory;
 		}
 
-		unsigned        size = get_type_size_bytes(tp);
-		amd64_abi_state save = *s;
+		unsigned        size  = get_type_size_bytes(tp);
+		amd64_abi_state reset = *s;
 		if (size <= 8) {
 			amd64_class c = get_eightbyte_class(s, tp, 0);
 			if (c == class_memory) {
-				*s = save;
+				*s = reset;
 			}
 			return c;
 		} else if (size <= 16) {
 			amd64_class c1 = get_eightbyte_class(s, tp, 0);
 			amd64_class c2 = get_eightbyte_class(s, tp, 8);
 			if (c1 == class_memory || c2 == class_memory) {
-				*s = save;
+				*s = reset;
 				return class_memory;
 			} else {
 				/* Arbitrary choice */
 				return c1;
 			}
 		} else {
-			*s = save;
+			*s = reset;
 			return class_memory;
 		}
 	}
@@ -256,11 +256,11 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 		for (unsigned i = 0; i < n; i++) {
 			ir_entity       *member      = get_compound_member(tp, i);
 			ir_type         *member_type = get_entity_type(member);
-			amd64_abi_state  save        = *s;
+			amd64_abi_state  reset       = *s;
 			amd64_class      class       = classify_compound_for_amd64(s, member_type);
 
 			if (class == class_memory) {
-				*s = save;
+				*s = reset;
 				return class_memory;
 			}
 			if (class != class_sse) {
@@ -270,8 +270,9 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 			max_state.integer_params = MAX(max_state.integer_params, s->integer_params);
 			max_state.sse_params     = MAX(max_state.sse_params,     s->sse_params);
 			/* Reset registers for the next member */
-			*s = save;
+			*s = reset;
 		}
+		*s = max_state;
 
 		return is_sse ? class_sse : class_integer;
 	}
@@ -296,14 +297,14 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 			return class_memory;
 		}
 
-		amd64_abi_state  save   = *s;
+		amd64_abi_state  reset  = *s;
 		unsigned         n_regs = (n_bytes + 7) / 8;
 		bool             is_sse = classify_compound_for_amd64(s, elem_type) == class_sse;
 		unsigned        *r;
 		unsigned         max;
 
 		/* Reset registers because we are going to count them ourselves */
-		*s = save;
+		*s = reset;
 
 		if (is_sse) {
 			r   = &s->sse_params;
@@ -315,7 +316,7 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 
 		for (unsigned i = 0; i < n_regs; i++) {
 			if (!try_free_register(r, max)) {
-				*s = save;
+				*s = reset;
 				return class_memory;
 			}
 		}
