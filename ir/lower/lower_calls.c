@@ -50,7 +50,7 @@ static ir_type *get_pointer_type(ir_type *dest_type)
 	return res;
 }
 
-static void fix_parameter_entities(ir_graph *irg, unsigned arg_shift)
+static void fix_parameter_entities(ir_graph *irg, unsigned *arg_map)
 {
 	ir_type *frame_type = get_irg_frame_type(irg);
 	size_t   n_members  = get_compound_n_members(frame_type);
@@ -64,7 +64,7 @@ static void fix_parameter_entities(ir_graph *irg, unsigned arg_shift)
 		size_t num = get_entity_parameter_number(member);
 		if (num == IR_VA_START_PARAMETER_NUMBER)
 			continue;
-		set_entity_parameter_number(member, num + arg_shift);
+		set_entity_parameter_number(member, arg_map[num]);
 	}
 }
 
@@ -434,7 +434,7 @@ struct cl_entry {
  * Walker environment for fix_args_and_collect_calls().
  */
 typedef struct wlk_env {
-	unsigned             arg_shift;        /**< The Argument index shift for parameters. */
+	unsigned             *arg_map ;        /**< Map from old to new argument indices. */
 	struct obstack       obst;             /**< An obstack to allocate the data on. */
 	cl_entry             *cl_list;         /**< The call list. */
 	compound_call_lowering_flags flags;
@@ -555,10 +555,10 @@ static void fix_args_and_collect_calls(ir_node *n, void *ctx)
 		ir_node  *pred = get_Proj_pred(n);
 		ir_graph *irg  = get_irn_irg(n);
 		if (pred == get_irg_args(irg)) {
-			unsigned arg_shift = env->arg_shift;
-			if (arg_shift > 0) {
-				unsigned pn = get_Proj_num(n);
-				set_Proj_num(n, pn + arg_shift);
+			unsigned pn = get_Proj_num(n);
+			unsigned new_pn = env->arg_map[pn];
+			if (new_pn != pn) {
+				set_Proj_num(n, new_pn);
 				env->changed = true;
 			}
 		} else if (is_Call(pred)) {
@@ -1078,8 +1078,10 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 	size_t     n_param_com = 0;
 
 	/* calculate the number of compound returns */
-	size_t   n_ret_com = 0;
-	unsigned arg_shift = 0;
+	size_t    n_ret_com = 0;
+	unsigned *arg_map   = ALLOCANZ(unsigned, n_lower_params);
+	unsigned  arg       = 0;
+
 	for (size_t i = 0; i < n_ress; ++i) {
 		ir_type *type = get_method_res_type(mtp, i);
 		if (is_aggregate_type(type)) {
@@ -1087,29 +1089,29 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 			/* if we don't return it as values, then we will add a new parameter
 			 * with the address of the destination memory */
 			if (return_in_ints(flags, type) == 0)
-				++arg_shift;
+				++arg;
 		}
 	}
 	for (size_t i = 0; i < n_params; ++i) {
+		arg_map[i] = arg++;
 		ir_type *type = get_method_param_type(mtp, i);
 		if (is_aggregate_type(type))
 			++n_param_com;
 	}
 
-	if (arg_shift > 0)
-		fix_parameter_entities(irg, arg_shift);
+	if (arg_map[n_params - 1] != n_params - 1)
+		fix_parameter_entities(irg, arg_map);
 
 	/* much easier if we have only one return */
 	if (n_ret_com != 0)
 		assure_irg_properties(irg, IR_GRAPH_PROPERTY_ONE_RETURN);
 
-	ir_type *lowered_mtp = lower_mtp(flags, mtp);
 	set_entity_type(ent, lowered_mtp);
 
 	wlk_env env;
 	memset(&env, 0, sizeof(env));
 	obstack_init(&env.obst);
-	env.arg_shift      = arg_shift;
+	env.arg_map        = arg_map;
 	env.flags          = flags;
 	env.mtp            = mtp;
 	env.lowered_mtp    = lowered_mtp;
