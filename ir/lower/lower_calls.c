@@ -299,10 +299,42 @@ static void notify_amd64_scalar_parameter(amd64_abi_state *s, ir_type *param_typ
 }
 
 /**
+ * A call list entry.
+ */
+typedef struct cl_entry cl_entry;
+struct cl_entry {
+	cl_entry *next;   /**< Pointer to the next entry. */
+	ir_node  *call;   /**< Pointer to the Call node. */
+	ir_node  *copyb;  /**< List of all CopyB nodes. */
+	ir_node  *proj_M;
+	ir_node  *proj_res;
+	unsigned  n_compound_ret;
+	bool      has_compound_param;
+};
+
+/**
+ * Walker environment for fix_args_and_collect_calls().
+ */
+typedef struct wlk_env {
+	unsigned             *arg_map ;        /**< Map from old to new argument indices. */
+	struct obstack       obst;             /**< An obstack to allocate the data on. */
+	cl_entry             *cl_list;         /**< The call list. */
+	compound_call_lowering_flags flags;
+	ir_type              *mtp;             /**< original mtp before lowering */
+	ir_type              *lowered_mtp;     /**< The lowered method type of the current irg if any. */
+	ir_heights_t         *heights;         /**< Heights for reachability check. */
+	bool                  only_local_mem:1;/**< Set if only local memory access was found. */
+	bool                  changed:1;       /**< Set if the current graph was changed. */
+	ir_node             **param_members;
+} wlk_env;
+
+/**
  * Creates a new lowered type for a method type with compound
  * arguments. The new type is associated to the old one and returned.
+ * If the AMD64 ABI is used, the lowered type's link points to an
+ * array containing the register classes.
  */
-static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
+static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 {
 	if (!is_Method_type(mtp))
 		return mtp;
@@ -322,6 +354,7 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 			break;
 		}
 	}
+	compound_call_lowering_flags flags = env->flags;
 	if (!must_be_lowered && !(flags & LF_DONT_LOWER_ARGUMENTS)) {
 		for (size_t i = 0; i < n_params; ++i) {
 			ir_type *param_type = get_method_param_type(mtp, i);
@@ -331,17 +364,29 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 			}
 		}
 	}
-	if (!must_be_lowered)
+	if (!must_be_lowered) {
+		set_type_link(mtp, NULL);
 		return mtp;
+	}
 
-	ir_type **params    = ALLOCANZ(ir_type*, n_params * 2 + n_ress);
-	ir_type **results   = ALLOCANZ(ir_type*, n_ress * 2);
-	size_t    nn_params = 0;
-	size_t    nn_ress   = 0;
+	ir_printf("Lowering type %+F...\n", mtp);
+
+	ir_type **params           = ALLOCANZ(ir_type*, n_params * 2 + n_ress);
+	ir_type **results          = ALLOCANZ(ir_type*, n_ress * 2);
+	size_t    nn_params        = 0;
+	size_t    nn_ress          = 0;
 	amd64_abi_state s = {
 		.sse_params = 0,
 		.integer_params = 0,
 	};
+	amd64_class (*amd64_classes)[2] = NULL;
+	if (flags & LF_USE_AMD64_ABI) {
+		/* OALLOCNZ chokes on this type. */
+		unsigned l = sizeof(amd64_class[2]) * n_params;
+		amd64_classes = (amd64_class (*)[2]) obstack_alloc(&env->obst, l);
+		memset(amd64_classes, 0, l);
+		ir_printf("Class array: %p (length %d)\n", amd64_classes, l);
+	}
 
 	/* add a hidden parameter in front for every compound result */
 	for (size_t i = 0; i < n_ress; ++i) {
@@ -376,7 +421,7 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 		if (!(flags & LF_DONT_LOWER_ARGUMENTS)
 		    && is_aggregate_type(param_type)) {
 			if (flags & LF_USE_AMD64_ABI) {
-				amd64_class classes[2];
+				amd64_class *classes = amd64_classes[i];
 				classify_for_amd64(&s, param_type, classes);
 				if (classes[0] != class_memory) {
 					params[nn_params++] = get_amd64_class_type(classes[0]);
@@ -399,6 +444,10 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 	assert(nn_ress <= n_ress*2);
 	assert(nn_params <= n_params*2 + n_ress);
 
+	for (size_t i = 0; i < n_params; i++) {
+		ir_printf("Param %d has classes %d %d\n", i, amd64_classes[i][0], amd64_classes[i][1]);
+	}
+
 	/* create the new type */
 	lowered = new_type_method(nn_params, nn_ress);
 	set_type_dbg_info(lowered, get_type_dbg_info(mtp));
@@ -410,6 +459,8 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 		set_method_res_type(lowered, i, results[i]);
 
 	set_method_variadic(lowered, is_method_variadic(mtp));
+
+	set_type_link(lowered, amd64_classes);
 
 	unsigned cconv = get_method_calling_convention(mtp);
 	if (nn_params > n_params) {
@@ -429,37 +480,6 @@ static ir_type *lower_mtp(compound_call_lowering_flags flags, ir_type *mtp)
 
 	return lowered;
 }
-
-/**
- * A call list entry.
- */
-typedef struct cl_entry cl_entry;
-struct cl_entry {
-	cl_entry *next;   /**< Pointer to the next entry. */
-	ir_node  *call;   /**< Pointer to the Call node. */
-	ir_node  *copyb;  /**< List of all CopyB nodes. */
-	ir_node  *proj_M;
-	ir_node  *proj_res;
-	unsigned  n_compound_ret;
-	bool      has_compound_param;
-};
-
-/**
- * Walker environment for fix_args_and_collect_calls().
- */
-typedef struct wlk_env {
-	unsigned             *arg_map ;        /**< Map from old to new argument indices. */
-	amd64_class         (*arg_classes)[2]; /**< AMD64 classification of arguments. */
-	struct obstack       obst;             /**< An obstack to allocate the data on. */
-	cl_entry             *cl_list;         /**< The call list. */
-	compound_call_lowering_flags flags;
-	ir_type              *mtp;             /**< original mtp before lowering */
-	ir_type              *lowered_mtp;     /**< The lowered method type of the current irg if any. */
-	ir_heights_t         *heights;         /**< Heights for reachability check. */
-	bool                  only_local_mem:1;/**< Set if only local memory access was found. */
-	bool                  changed:1;       /**< Set if the current graph was changed. */
-	ir_node             **param_members;
-} wlk_env;
 
 /**
  * Return the call list entry of a call node.
@@ -955,45 +975,51 @@ static ir_node *get_compound_slice(ir_node *block, ir_node *ptr, int offset,
 
 static void fix_call_compound_params(const cl_entry *entry, const ir_type *higher, wlk_env *env)
 {
-	ir_node   *call           = entry->call;
-	dbg_info  *dbgi           = get_irn_dbg_info(call);
-	ir_node   *mem            = get_Call_mem(call);
-	ir_graph  *irg            = get_irn_irg(call);
-	ir_node   *frame          = get_irg_frame(irg);
-	size_t     n_params       = get_method_n_params(higher);
-	ir_type   *lower          = get_Call_type(call);
-	size_t     n_params_lower = get_method_n_params(lower);
-	ir_node  **new_in         = ALLOCANZ(ir_node*, n_params_lower);
+	ir_node      *call           = entry->call;
+	dbg_info     *dbgi           = get_irn_dbg_info(call);
+	ir_node      *mem            = get_Call_mem(call);
+	ir_graph     *irg            = get_irn_irg(call);
+	ir_node      *frame          = get_irg_frame(irg);
+	size_t        n_params       = get_method_n_params(higher);
+	ir_type      *lower          = get_Call_type(call);
+	size_t        n_params_lower = get_method_n_params(lower);
+	ir_node     **new_in         = ALLOCANZ(ir_node*, n_params_lower);
+	amd64_class (*classes)[2]    = (amd64_class(*)[2]) get_type_link(lower);
+
+	ir_printf("Fixing %+F :: %+F\n", call, higher);
 
 	/* h counts higher type parameters, l counts lower type parameters */
 	size_t l = 0;
 	for (size_t h = 0; h < n_params; ++h) {
 		assert(l < n_params_lower);
 
-		ir_type *type = get_method_param_type(higher, h);
-		if (!is_aggregate_type(type) || (env->flags & LF_DONT_LOWER_ARGUMENTS))
-			continue;
-
-		ir_node *arg = get_Call_param(call, h);
 		ir_type *arg_type = get_method_param_type(higher, h);
+		ir_node *arg = get_Call_param(call, h);
+		if (!is_aggregate_type(arg_type) || (env->flags & LF_DONT_LOWER_ARGUMENTS)) {
+			new_in[l++] = arg;
+			continue;
+		}
 
+		ir_printf("Compound argument %d :: %+F\n", h, arg_type);
 		if (env->flags & LF_USE_AMD64_ABI) {
+			ir_printf("Class array: %p\n", classes);
+			ir_printf("amd64_classes: %d %d\n", classes[h][0], classes[h][1]);
 			ir_node *block = get_nodes_block(call);
 			ir_type *lower_arg_type = get_method_param_type(lower, l);
 
 			new_in[l++] = get_compound_slice(block, arg, 0,
 			                                 arg_type, lower_arg_type, &mem);
-			if (env->arg_classes[h][1] != class_no_class) {
+			if (classes[h][1] != class_no_class) {
 				lower_arg_type = get_method_param_type(lower, l);
 				new_in[l++] = get_compound_slice(block, arg, 8,
 				                                 arg_type, lower_arg_type, &mem);
 			}
 		} else {
-			ir_entity *arg_entity  = create_compound_arg_entity(irg, type);
+			ir_entity *arg_entity  = create_compound_arg_entity(irg, arg_type);
 			ir_node   *block       = get_nodes_block(call);
 			ir_node   *sel         = new_rd_Member(dbgi, block, frame, arg_entity);
 			bool       is_volatile = is_partly_volatile(arg);
-			mem = new_rd_CopyB(dbgi, block, mem, sel, arg, type,
+			mem = new_rd_CopyB(dbgi, block, mem, sel, arg, arg_type,
 			                   is_volatile ? cons_volatile : cons_none);
 			new_in[l++] = sel;
 		}
@@ -1011,7 +1037,7 @@ static void fix_calls(wlk_env *env)
 			continue;
 		ir_node *call        = entry->call;
 		ir_type *ctp         = get_Call_type(call);
-		ir_type *lowered_mtp = lower_mtp(env->flags, ctp);
+		ir_type *lowered_mtp = lower_mtp(ctp, env);
 		set_Call_type(call, lowered_mtp);
 
 		if (entry->has_compound_param) {
@@ -1120,7 +1146,8 @@ static void transform_return(ir_node *ret, size_t n_ret_com, wlk_env *env)
 	env->changed = true;
 }
 
-static ir_node *build_compound_from_arguments(ir_node *irn, wlk_env *env, unsigned pn, ir_type *tp)
+static ir_node *build_compound_from_arguments(ir_node *irn, wlk_env *env, unsigned pn, ir_type *tp,
+                                              amd64_class classes[static 2])
 {
 	ir_graph *irg        = get_irn_irg(irn);
 	ir_node  *block      = get_nodes_block(irn);
@@ -1137,9 +1164,7 @@ static ir_node *build_compound_from_arguments(ir_node *irn, wlk_env *env, unsign
 	ir_node *first = NULL;
 
 	for (unsigned i = 0; i < 2; i++) {
-		amd64_class cls = env->arg_classes[pn][i];
-
-		if (cls == class_no_class)
+		if (classes[i] == class_no_class)
 			break;
 
 		ir_type *lower_arg_type = get_method_param_type(env->lowered_mtp, pn + i);
@@ -1185,12 +1210,6 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 
 	unsigned *arg_map             = ALLOCANZ(unsigned, n_params);
 	unsigned  arg                 = 0;
-	amd64_class (*arg_classes)[2] = NULL;
-	if (flags & LF_USE_AMD64_ABI) {
-		/* ALLOCANZ fails for this strange type */
-		arg_classes = alloca(sizeof(amd64_class[2]) * n_params);
-		memset(arg_classes, 0, sizeof(amd64_class[2]) * n_params);
-	}
 
 	/* calculate the number of compound returns */
 	size_t n_ret_com = 0;
@@ -1218,8 +1237,9 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 			++n_param_com;
 
 		if (flags & LF_USE_AMD64_ABI) {
-			classify_for_amd64(&s, type, arg_classes[i]);
-			if (arg_classes[i][1] != class_no_class)
+			amd64_class classes[2];
+			classify_for_amd64(&s, type, classes);
+			if (classes[1] != class_no_class)
 				arg++;
 		}
 	}
@@ -1232,19 +1252,19 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 	if (n_ret_com != 0)
 		assure_irg_properties(irg, IR_GRAPH_PROPERTY_ONE_RETURN);
 
-	ir_type *lowered_mtp = lower_mtp(flags, mtp);
-	set_entity_type(ent, lowered_mtp);
-
 	wlk_env env;
 	memset(&env, 0, sizeof(env));
 	obstack_init(&env.obst);
 	env.arg_map        = arg_map;
-	env.arg_classes    = arg_classes;
 	env.flags          = flags;
 	env.mtp            = mtp;
-	env.lowered_mtp    = lowered_mtp;
 	env.param_members  = NEW_ARR_F(ir_node*, 0);
 	env.only_local_mem = true;
+
+	ir_type *lowered_mtp = lower_mtp(mtp, &env);
+	set_entity_type(ent, lowered_mtp);
+
+	env.lowered_mtp    = lowered_mtp;
 
 	/* scan the code, fix argument numbers and collect calls. */
 	ir_reserve_resources(irg, IR_RESOURCE_IRN_LINK);
@@ -1253,6 +1273,7 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 
 	/* fix parameter sels */
 	ir_node *args = get_irg_args(irg);
+	amd64_class (*arg_classes)[2] = get_type_link(lowered_mtp);
 	assure_irg_properties(irg, IR_GRAPH_PROPERTY_CONSISTENT_OUT_EDGES);
 	for (size_t i = 0, n = ARR_LEN(env.param_members); i < n; ++i) {
 		ir_node   *member = env.param_members[i];
@@ -1263,7 +1284,7 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 		if (flags & LF_USE_AMD64_ABI &&
 		    arg_classes[num][0] != class_memory) {
 			ir_type *tp = get_entity_type(entity);
-			ptr = build_compound_from_arguments(member, &env, num, tp);
+			ptr = build_compound_from_arguments(member, &env, num, tp, arg_classes[num]);
 		} else {
 			ptr = new_r_Proj(args, mode_P, num);
 		}
@@ -1300,19 +1321,16 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg)
 static void lower_method_types(ir_type *const type, ir_entity *const entity,
                                void *const env)
 {
-	const compound_call_lowering_flags *flags
-		= (const compound_call_lowering_flags*)env;
-
 	/* fix method entities */
 	if (entity != NULL) {
 		ir_type *tp      = get_entity_type(entity);
-		ir_type *lowered = lower_mtp(*flags, tp);
+		ir_type *lowered = lower_mtp(tp, env);
 		set_entity_type(entity, lowered);
 	} else {
 		/* fix pointer to methods */
 		if (is_Pointer_type(type)) {
 			ir_type *points_to         = get_pointer_points_to_type(type);
-			ir_type *lowered_points_to = lower_mtp(*flags, points_to);
+			ir_type *lowered_points_to = lower_mtp(points_to, env);
 			set_pointer_points_to_type(type, lowered_points_to);
 		}
 	}
