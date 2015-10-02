@@ -209,7 +209,9 @@ static amd64_class classify_slice_for_amd64(ir_type *tp, unsigned min, unsigned 
 		ir_mode *mode_long_double = get_type_mode(be_get_backend_param()->type_long_double);
 		ir_mode *mode = get_type_mode(tp);
 
-		if (mode == mode_long_double) {
+		if (min >= get_type_size_bytes(tp)) {
+			return class_no_class;
+		} else if (mode == mode_long_double) {
 			return class_x87;
 		} else if (mode_is_float(mode)) {
 			return class_sse;
