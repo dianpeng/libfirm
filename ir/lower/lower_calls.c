@@ -1314,7 +1314,8 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg, str
 	}
 
 
-	if (arg_map[n_params - 1] != n_params - 1)
+	if (arg_map[n_params - 1] != n_params - 1 ||
+	    (flags & LF_AMD64_ABI_STRUCTS))
 		fix_parameter_entities(irg, arg_map);
 
 	/* much easier if we have only one return */
