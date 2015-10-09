@@ -1016,13 +1016,13 @@ static void fix_call_compound_params(const cl_entry *entry, const ir_type *highe
 	ir_node     **new_in         = ALLOCANZ(ir_node*, n_params_lower + 2);
 	amd64_class (*classes)[2]    = (amd64_class(*)[2]) get_type_link(lower);
 
-	static const size_t fixed_call_args = 2;
+	static const size_t fixed_call_args = n_Call_max + 1;
 	new_in[n_Call_mem] = get_Call_mem(call);
 	new_in[n_Call_ptr] = get_Call_ptr(call);
 
 	/* h counts higher type parameters, l counts Call input
 	 * numbers (i.e. lower type parameters + memory and ptr) */
-	size_t l = 2;
+	size_t l = fixed_call_args;
 
 #define INPUT_TO_PARAM(x) ((x) - fixed_call_args + n_compound_ret)
 #define PARAM_TO_INPUT(x) ((x) + fixed_call_args - n_compound_ret)
