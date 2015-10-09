@@ -101,6 +101,243 @@ static unsigned return_in_ints(compound_call_lowering_flags flags, ir_type *tp)
 	return n_regs;
 }
 
+static const int max_integer_params = 6;
+static const int max_sse_params = 8;
+
+typedef enum {
+	class_no_class,
+	class_integer,
+	class_sse,
+	class_x87,
+	class_memory,
+} amd64_class;
+
+typedef struct {
+	unsigned integer_params;
+	unsigned sse_params;
+	unsigned regs_full;
+	unsigned current_reg_size;
+} amd64_abi_state;
+
+static bool try_free_register(unsigned *r, unsigned max)
+{
+	if (*r < max) {
+		(*r)++;
+		return true;
+	} else {
+		return false;
+	}
+}
+
+/*
+ * Note that this is *not* the real thing. Actually, we would have to
+ * classify both registers of a struct separately and return two
+ * values here. However, this function will return class_integer or
+ * class_sse iff the type is passed/returned in one or more registers.
+ */
+static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
+{
+	switch(get_type_tpop_code(tp)) {
+	case tpo_class:
+		/* Classes are not quite like structs. We need to
+		 * check whether the class "has either a non-trivial
+		 * copy constructor or a non-trivial destructor" (ABI
+		 * sect. 3.2.3). */
+		panic("classes not supported");
+
+	case tpo_struct: {
+		amd64_abi_state save             = *s;
+		amd64_class     current_class    = class_no_class;
+		unsigned        n                = get_compound_n_members(tp);
+
+		for (unsigned i = 0; i < n; i++) {
+			ir_entity *member      = get_compound_member(tp, i);
+			ir_type   *member_tp   = get_entity_type(member);
+			unsigned   member_size = get_type_size_bytes(member_tp);
+
+			/* Does the type fit in the current register? */
+			s->current_reg_size = round_up2(s->current_reg_size, member_size);
+			s->current_reg_size += member_size;
+			if (s->current_reg_size > 8) {
+				/* Do we have another register to use? */
+				if (s->regs_full == 0) {
+					s->regs_full++;
+					s->current_reg_size = member_size;
+
+					unsigned *r;
+					unsigned  max;
+					if (current_class == class_sse) {
+						r   = &s->sse_params;
+						max = max_sse_params;
+					} else if (current_class == class_integer) {
+						r   = &s->integer_params;
+						max = max_integer_params;
+					}
+					if (!try_free_register(r, max)) {
+						*s = save;
+						return class_memory;
+					}
+				} else {
+					*s = save;
+					return class_memory;
+				}
+			}
+
+			amd64_class member_class = classify_compound_for_amd64(s, member_tp);
+
+			/* See AMD64 ABI, sect. 3.2.3, paragraph
+			 * "Classification", no. 4 */
+			if (current_class == member_class) {
+				continue;
+			} else if (current_class == class_no_class) {
+				current_class = member_class;
+			} else if (member_class == class_no_class) {
+				continue;
+			} else if (member_class == class_memory) {
+				/* Once we arrive here, our class is
+				 * always going to be class_memory. */
+				*s = save;
+				return class_memory;
+			} else if (current_class == class_integer) {
+				continue;
+			} else if (member_class == class_integer) {
+				current_class = class_integer;
+			} else {
+				current_class = class_sse;
+			}
+		}
+
+		return current_class;
+	}
+
+	case tpo_union: {
+		amd64_abi_state save                = *s;
+		amd64_class     current_class       = class_no_class;
+		unsigned        n                   = get_compound_n_members(tp);
+		amd64_abi_state max_fill            = *s;
+
+		for (unsigned i = 0; i < n; i++) {
+			ir_entity   *member       = get_compound_member(tp, i);
+			ir_type     *member_tp    = get_entity_type(member);
+			amd64_class  member_class = classify_compound_for_amd64(s, member_tp);
+
+			/* See AMD64 ABI, sect. 3.2.3, paragraph
+			 * "Classification", no. 4 */
+			if (current_class == member_class) {
+				continue;
+			} else if (current_class == class_no_class) {
+				current_class = member_class;
+			} else if (member_class == class_no_class) {
+				continue;
+			} else if (member_class == class_memory) {
+				/* Once we arrive here, our class is
+				 * always going to be class_memory. */
+				*s = save;
+				return class_memory;
+			} else if (current_class == class_integer) {
+				continue;
+			} else if (member_class == class_integer) {
+				current_class = class_integer;
+			} else {
+				current_class = class_sse;
+			}
+
+			max_fill.integer_params   = MAX(max_fill.integer_params,   s->integer_params);
+			max_fill.sse_params       = MAX(max_fill.sse_params,       s->sse_params);
+			max_fill.regs_full        = MAX(max_fill.regs_full,        s->regs_full);
+			max_fill.current_reg_size = MAX(max_fill.current_reg_size, s->current_reg_size);
+			/* Reset registers for next member */
+			*s = save;
+		}
+		*s = max_fill;
+
+		return current_class;
+	}
+
+	case tpo_array: {
+		amd64_abi_state  save          = *s;
+		unsigned         n             = get_array_size_int(tp);
+		ir_type         *elem_type     = get_array_element_type(tp);
+		amd64_class      current_class = class_no_class;
+
+		for (unsigned i = 0; i < n; i++) {
+			amd64_class elem_class = classify_compound_for_amd64(s, elem_type);
+
+			/* elem_class should at most once change from
+			 * whatever it was before to class_integer.
+			 * This makes the logic a bit easier here. */
+			if (elem_class == class_memory) {
+				*s = save;
+				return class_memory;
+			} else if (elem_class == class_integer) {
+				current_class = class_integer;
+			} else if (elem_class == class_sse) {
+				current_class = class_sse;
+			}
+		}
+
+		return current_class;
+	}
+
+	case tpo_primitive:
+		if (get_mode_sort(get_type_mode(tp)) & irms_float_number) {
+			return class_sse;
+		}
+		/* Fallthrough */
+	case tpo_pointer:
+		return class_integer;
+
+	case tpo_uninitialized:
+	case tpo_method:
+	case tpo_code:
+	case tpo_unknown:
+		break;
+	}
+	panic("invalid type");
+}
+
+static amd64_class classify_for_amd64(amd64_abi_state *s, ir_type *tp)
+{
+	switch(get_type_tpop_code(tp)) {
+	case tpo_class:
+		/* Classes are not quite like structs. We need to
+		 * check whether the class "has either a non-trivial
+		 * copy constructor or a non-trivial destructor" (ABI
+		 * sect. 3.2.3). */
+		panic("classes not supported");
+
+	case tpo_struct:
+	case tpo_union:
+	case tpo_array:
+		s->regs_full        = 0;
+		s->current_reg_size = 0;
+		return classify_compound_for_amd64(s, tp);
+
+	case tpo_primitive:
+		if (get_mode_sort(get_type_mode(tp)) & irms_float_number) {
+			if (try_free_register(&s->sse_params, max_sse_params)) {
+				return class_sse;
+			} else {
+				return class_memory;
+			}
+		}
+		/* Fallthrough */
+	case tpo_pointer:
+		if (try_free_register(&s->integer_params, max_integer_params)) {
+			return class_integer;
+		} else {
+			return class_memory;
+		}
+
+	case tpo_uninitialized:
+	case tpo_method:
+	case tpo_code:
+	case tpo_unknown:
+		break;
+	}
+	panic("invalid type");
+}
+
 /**
  * Creates a new lowered type for a method type with compound
  * arguments. The new type is associated to the old one and returned.
