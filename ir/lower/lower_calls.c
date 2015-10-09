@@ -461,7 +461,6 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 				}
 			} else {
 				params[nn_params++] = new_type_pointer(param_type);
-				grow_amd64_no_class(obst);
 			}
 		} else {
 			params[nn_params++] = param_type;
