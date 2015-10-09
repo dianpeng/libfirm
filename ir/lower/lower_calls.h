@@ -28,7 +28,7 @@ typedef enum compound_call_lowering_flags {
 	LF_RETURN_SMALL_STRUCT_IN_INTS = 1 << 3,
 	/** Return and pass small structs in registers according to
 	 * the AMD64 ABI */
-	LF_USE_AMD64_ABI = 1 << 4 | LF_RETURN_HIDDEN,
+	LF_AMD64_ABI_STRUCTS = 1 << 4,
 } compound_call_lowering_flags;
 ENUM_BITSET(compound_call_lowering_flags)
 

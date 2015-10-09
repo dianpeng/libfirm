@@ -108,6 +108,16 @@ static const int max_integer_params = 6;
 static const int max_sse_params = 8;
 
 typedef enum {
+	/*
+	 * Since we only deal with aggreate types here, parameters of
+	 * primitive types are not assigned an amd64_class, and are
+	 * classified as {class_no_class, class_no_class} (This is
+	 * different from the ABI, but suits us better).
+	 *
+	 * If an aggregate type has size <= 8, it is classified as
+	 * {..., class_no_class} to show that its "second half" is
+	 * empty, and that it only occupies one register.
+	 */
 	class_no_class,
 	class_integer,
 	class_sse,
@@ -150,8 +160,8 @@ static bool try_free_register(unsigned *r, unsigned max)
 	}
 }
 
-/* For the algorithm see the AMD64 ABI, Chap. 3.2.3,
- * Par. "Classification", No. 4 */
+/* For the algorithm see the AMD64 ABI, sect. 3.2.3,
+ * par. "Classification", no. 4 */
 static amd64_class fold_classes(amd64_class c1, amd64_class c2)
 {
 	if (c1 == c2) {
@@ -241,10 +251,14 @@ static amd64_class classify_slice_for_amd64(ir_type *tp, unsigned min, unsigned 
 	panic("invalid type");
 }
 
-static void classify_for_amd64(amd64_abi_state *s, ir_type *tp, amd64_class classes[static 2])
+static void classify_for_amd64_and_notify_parameters(amd64_abi_state *s, ir_type *tp, amd64_class classes[static 2])
 {
 	amd64_abi_state reset = *s;
 
+	/* According to the ABI, sect. 3.2.3, par. "Classification",
+	 * no. 1 (note Footnote 10!), types larger than 2 eightbytes
+	 * (except __m256, which libfirm does not support) are passed
+	 * in memory. */
 	if (get_type_size_bytes(tp) > 2 * 8) {
 		goto use_class_memory;
 	} else {
@@ -283,7 +297,7 @@ use_class_memory:
 static bool needs_two_amd64_registers(amd64_abi_state *s, ir_type *tp)
 {
 	amd64_class c[2];
-	classify_for_amd64(s, tp, c);
+	classify_for_amd64_and_notify_parameters(s, tp, c);
 	return c[1] != class_no_class;
 }
 
@@ -427,7 +441,7 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 				params[nn_params++] = ptr_tp;
 				if (flags & LF_RETURN_HIDDEN)
 					results[nn_ress++] = ptr_tp;
-				if (flags & LF_USE_AMD64_ABI) {
+				if (flags & LF_AMD64_ABI_STRUCTS) {
 					notify_amd64_scalar_parameter(&s, ptr_tp);
 					grow_amd64_no_class(obst);
 				}
@@ -442,9 +456,9 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 		ir_type *param_type = get_method_param_type(mtp, i);
 		if (!(flags & LF_DONT_LOWER_ARGUMENTS)
 		    && is_aggregate_type(param_type)) {
-			if (flags & LF_USE_AMD64_ABI) {
+			if (flags & LF_AMD64_ABI_STRUCTS) {
 				amd64_class classes[2];
-				classify_for_amd64(&s, param_type, classes);
+				classify_for_amd64_and_notify_parameters(&s, param_type, classes);
 				if (classes[0] != class_memory) {
 					params[nn_params++] = get_amd64_class_type(classes[0]);
 					grow_amd64_classes(obst, classes);
@@ -464,7 +478,7 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 			}
 		} else {
 			params[nn_params++] = param_type;
-			if (flags & LF_USE_AMD64_ABI) {
+			if (flags & LF_AMD64_ABI_STRUCTS) {
 				notify_amd64_scalar_parameter(&s, param_type);
 				grow_amd64_no_class(obst);
 			}
@@ -485,7 +499,7 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 
 	set_method_variadic(lowered, is_method_variadic(mtp));
 
-	if (flags & LF_USE_AMD64_ABI) {
+	if (flags & LF_AMD64_ABI_STRUCTS) {
 		amd64_class (*amd64_classes)[2] = obstack_finish(obst);
 		set_type_link(lowered, amd64_classes);
 	}
@@ -1019,34 +1033,34 @@ static void fix_call_compound_params(const cl_entry *entry, const ir_type *highe
 	new_in[n_Call_mem] = get_Call_mem(call);
 	new_in[n_Call_ptr] = get_Call_ptr(call);
 
-	/* h counts higher type parameters, l counts Call input
+	/* h counts higher type parameters, i counts Call input
 	 * numbers (i.e. lower type parameters + memory and ptr) */
-	size_t l = fixed_call_args;
+	size_t i = fixed_call_args;
 
 #define INPUT_TO_PARAM(x) ((x) - fixed_call_args + n_compound_ret)
 #define PARAM_TO_INPUT(x) ((x) + fixed_call_args - n_compound_ret)
 
 	DEBUG_ONLY(size_t max_input = PARAM_TO_INPUT(n_params_lower));
 	for (size_t h = 0; h < n_params; ++h) {
-		assert(l < max_input);
+		assert(i < max_input);
 
 		ir_type *arg_type = get_method_param_type(higher, h);
 		ir_node *arg = get_Call_param(call, h);
 		if (!is_aggregate_type(arg_type) || (env->flags & LF_DONT_LOWER_ARGUMENTS)) {
-			new_in[l++] = arg;
+			new_in[i++] = arg;
 			continue;
 		}
 
-		if (env->flags & LF_USE_AMD64_ABI) {
+		if (env->flags & LF_AMD64_ABI_STRUCTS) {
 			ir_node *block = get_nodes_block(call);
-			ir_type *lower_arg_type = get_method_param_type(lower, INPUT_TO_PARAM(l));
-			amd64_class second_half = classes[INPUT_TO_PARAM(l)][1];
+			ir_type *lower_arg_type = get_method_param_type(lower, INPUT_TO_PARAM(i));
+			amd64_class second_half = classes[INPUT_TO_PARAM(i)][1];
 
-			new_in[l++] = get_compound_slice(block, arg, 0,
+			new_in[i++] = get_compound_slice(block, arg, 0,
 			                                 arg_type, lower_arg_type, &mem);
 			if (second_half != class_no_class) {
-				lower_arg_type = get_method_param_type(lower, INPUT_TO_PARAM(l));
-				new_in[l++] = get_compound_slice(block, arg, 8,
+				lower_arg_type = get_method_param_type(lower, INPUT_TO_PARAM(i));
+				new_in[i++] = get_compound_slice(block, arg, 8,
 				                                 arg_type, lower_arg_type, &mem);
 			}
 		} else {
@@ -1056,12 +1070,12 @@ static void fix_call_compound_params(const cl_entry *entry, const ir_type *highe
 			bool       is_volatile = is_partly_volatile(arg);
 			mem = new_rd_CopyB(dbgi, block, mem, sel, arg, arg_type,
 			                   is_volatile ? cons_volatile : cons_none);
-			new_in[l++] = sel;
+			new_in[i++] = sel;
 		}
 	}
 
-	assert(l == max_input);
-	set_irn_in(call, l, new_in);
+	assert(i == max_input);
+	set_irn_in(call, i, new_in);
 	set_Call_mem(call, mem);
 
 #undef PARAM_TO_INPUT
@@ -1277,9 +1291,9 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg, str
 		if (is_aggregate_type(type))
 			++n_param_com;
 
-		if (flags & LF_USE_AMD64_ABI) {
+		if (flags & LF_AMD64_ABI_STRUCTS) {
 			amd64_class classes[2];
-			classify_for_amd64(&s, type, classes);
+			classify_for_amd64_and_notify_parameters(&s, type, classes);
 			if (classes[1] != class_no_class)
 				arg++;
 		}
@@ -1326,7 +1340,7 @@ static void transform_irg(compound_call_lowering_flags flags, ir_graph *irg, str
 			continue;
 		}
 
-		if (flags & LF_USE_AMD64_ABI &&
+		if (flags & LF_AMD64_ABI_STRUCTS &&
 		    arg_classes[num][0] != class_memory) {
 			assert(arg_classes[num][0] != class_no_class);
 			ir_type *tp = get_entity_type(entity);
