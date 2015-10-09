@@ -370,8 +370,6 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 		return mtp;
 	}
 
-	ir_printf("Lowering type %+F...\n", mtp);
-
 	ir_type **params           = ALLOCANZ(ir_type*, n_params * 2 + n_ress);
 	ir_type **results          = ALLOCANZ(ir_type*, n_ress * 2);
 	size_t    nn_params        = 0;
@@ -386,7 +384,6 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 		unsigned l = sizeof(amd64_class[2]) * n_params;
 		amd64_classes = (amd64_class (*)[2]) obstack_alloc(env->obst, l);
 		memset(amd64_classes, 0, l);
-		ir_printf("Class array: %p (length %d)\n", amd64_classes, l);
 	}
 
 	/* add a hidden parameter in front for every compound result */
@@ -444,10 +441,6 @@ static ir_type *lower_mtp(ir_type *mtp, wlk_env *env)
 	}
 	assert(nn_ress <= n_ress*2);
 	assert(nn_params <= n_params*2 + n_ress);
-
-	for (size_t i = 0; i < n_params; i++) {
-		ir_printf("Param %d has classes %d %d\n", i, amd64_classes[i][0], amd64_classes[i][1]);
-	}
 
 	/* create the new type */
 	lowered = new_type_method(nn_params, nn_ress);
@@ -988,8 +981,6 @@ static void fix_call_compound_params(const cl_entry *entry, const ir_type *highe
 	ir_node     **new_in         = ALLOCANZ(ir_node*, n_params_lower + 2);
 	amd64_class (*classes)[2]    = (amd64_class(*)[2]) get_type_link(lower);
 
-	ir_printf("Fixing %+F :: %+F\n", call, higher);
-
 	static const size_t fixed_call_args = 2;
 	new_in[n_Call_mem] = get_Call_mem(call);
 	new_in[n_Call_ptr] = get_Call_ptr(call);
@@ -1012,10 +1003,7 @@ static void fix_call_compound_params(const cl_entry *entry, const ir_type *highe
 			continue;
 		}
 
-		ir_printf("Compound argument %d :: %+F\n", h, arg_type);
 		if (env->flags & LF_USE_AMD64_ABI) {
-			ir_printf("Class array: %p\n", classes);
-			ir_printf("amd64_classes: %d %d\n", classes[h][0], classes[h][1]);
 			ir_node *block = get_nodes_block(call);
 			ir_type *lower_arg_type = get_method_param_type(lower, INPUT_TO_PARAM(l));
 
