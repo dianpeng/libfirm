@@ -126,7 +126,7 @@ static ir_mode *get_amd64_class_mode(amd64_class c)
 	case class_integer:
 		return mode_Lu;
 	case class_sse:
-		return mode_F;
+		return mode_D;
 	case class_no_class:
 	case class_x87:
 	case class_memory:
