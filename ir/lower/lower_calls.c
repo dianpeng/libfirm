@@ -1195,7 +1195,7 @@ static ir_node *build_compound_from_arguments(ir_node *irn, wlk_env *env, unsign
 	ir_entity *compound = new_entity(frame_type, id, tp);
 
 	ir_node *initial = get_irg_initial_mem(irg);
-	ir_node *mem   = get_irg_initial_mem(irg);
+	ir_node *mem   = initial;
 	ir_node *first = NULL;
 
 	for (unsigned i = 0; i < 2; i++) {
@@ -1217,12 +1217,15 @@ static ir_node *build_compound_from_arguments(ir_node *irn, wlk_env *env, unsign
 		ir_node *store = new_rd_Store(dbgi, block, mem, ptr, new_arg,
 		                              tp, cons_none);
 		mem = new_rd_Proj(dbgi, store, mode_M, pn_Store_M);
-		if (first == NULL)
-			first = mem;
+		if (first == NULL) {
+			first = store;
+		}
 	}
 
-	edges_reroute_except(initial, mem, first);
-	set_irg_initial_mem(irg, initial);
+	if (first != NULL) {
+		edges_reroute_except(initial, mem, first);
+		set_irg_initial_mem(irg, initial);
+	}
 
 	return new_rd_Member(dbgi, block, frame, compound);
 }
