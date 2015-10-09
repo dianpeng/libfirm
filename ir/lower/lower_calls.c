@@ -219,7 +219,20 @@ static amd64_class classify_slice_for_amd64(ir_type *tp, unsigned min, unsigned 
 
 	case tpo_array: {
 		ir_type *elem_type = get_array_element_type(tp);
-		return classify_slice_for_amd64(elem_type, min, max);
+		if (min < get_type_size_bytes(tp)) {
+			/* We are in the array */
+			size_t elem_size = get_type_size_bytes(elem_type);
+			if (min >= elem_size) {
+				/* ... but past the first element. Shift the slice range down. */
+				unsigned new_min = min % elem_size;
+				unsigned new_max = new_min + (max - min);
+				return classify_slice_for_amd64(elem_type, new_min, new_max);
+			} else {
+				return classify_slice_for_amd64(elem_type, min, max);
+			}
+		} else {
+			return class_no_class;
+		}
 	}
 	case tpo_primitive: {
 		ir_mode *mode_long_double = get_type_mode(be_get_backend_param()->type_long_double);
