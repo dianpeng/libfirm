@@ -101,6 +101,8 @@ static unsigned return_in_ints(compound_call_lowering_flags flags, ir_type *tp)
 	return n_regs;
 }
 
+/* Classification of arguments accoring to the AMD64 ABI */
+
 static const int max_integer_params = 6;
 static const int max_sse_params = 8;
 
@@ -117,6 +119,21 @@ typedef struct {
 	unsigned sse_params;
 } amd64_abi_state;
 
+static const char *class_name(amd64_class c)
+{
+#define NAME(x) case x: return #x
+	switch(c) {
+		NAME(class_no_class);
+		NAME(class_integer);
+		NAME(class_sse);
+		NAME(class_x87);
+		NAME(class_memory);
+	}
+#undef NAME
+
+	panic("Unknown amd64_class to print");
+}
+
 static bool try_free_register(unsigned *r, unsigned max)
 {
 	if (*r < max) {
@@ -127,75 +144,50 @@ static bool try_free_register(unsigned *r, unsigned max)
 	}
 }
 
-static bool has_unaligned_fields(ir_type *tp)
+/* For the algorithm see the AMD64 ABI, Chap. 3.2.3,
+ * Par. "Classification", No. 4 */
+static amd64_class fold_classes(amd64_class c1, amd64_class c2)
 {
-	if (is_compound_type(tp)) {
-		unsigned n = get_compound_n_members(tp);
-		for (unsigned i = 0; i < n; i++) {
-			ir_entity *member = get_compound_member(tp, i);
-			ir_type *member_tp = get_entity_type(member);
-			if (get_entity_aligned(member) == align_non_aligned ||
-			    has_unaligned_fields(member_tp)) {
-				return true;
-			}
-		}
-		return false;
-	} else if (is_Array_type(tp)) {
-		return has_unaligned_fields(get_array_element_type(tp));
+	if (c1 == c2) {
+		return c1;
+	} else if (c1 == class_no_class) {
+		return c2;
+	} else if (c2 == class_no_class) {
+		return c1;
+	} else if (c1 == class_memory || c2 == class_memory) {
+		return class_memory;
+	} else if (c1 == class_integer || c2 == class_integer) {
+		return class_integer;
+	} else if (c1 == class_x87 || c2 == class_x87) {
+		return class_memory;
 	} else {
-		return false;
+		return class_sse;
 	}
 }
 
-static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp);
+static amd64_class classify_slice_for_amd64(ir_type *tp, unsigned min, unsigned max);
 
-static bool all_members_sse(amd64_abi_state *s, ir_type *tp, unsigned min_offset, unsigned max_offset)
+static amd64_class classify_compound_by_members(ir_type *tp, unsigned min, unsigned max)
 {
 	unsigned n = get_compound_n_members(tp);
+	amd64_class current_class = class_no_class;
 	for (unsigned i = 0; i < n; i++) {
 		ir_entity *member = get_compound_member(tp, i);
 		unsigned offset = get_entity_offset(member);
 
-		if (min_offset <= offset && offset < max_offset) {
-			ir_type *member_type = get_entity_type(member);
-			amd64_class member_class = classify_compound_for_amd64(s, member_type);
-			if (member_class != class_sse) {
-				return false;
+		if (min <= offset && offset < max) {
+			if (get_entity_aligned(member) == align_non_aligned) {
+				return class_memory;
 			}
+			ir_type *member_type = get_entity_type(member);
+			amd64_class member_class = classify_slice_for_amd64(member_type, 0, max - offset);
+			current_class = fold_classes(current_class, member_class);
 		}
 	}
-	return true;
+	return current_class;
 }
 
-static amd64_class get_eightbyte_class(amd64_abi_state *s, ir_type *tp, unsigned offset)
-{
-	bool      use_sse = all_members_sse(s, tp, offset, offset + 8);
-	unsigned *r;
-	unsigned  max;
-	if (use_sse) {
-		r = &s->sse_params;
-		max = max_sse_params;
-	} else {
-		r = &s->integer_params;
-		max = max_integer_params;
-	}
-	if (try_free_register(r, max)) {
-		return use_sse ? class_sse : class_integer;
-	} else {
-		return class_memory;
-	}
-
-}
-
-/*
- * Note that we leave out the cases that the AMD64 backend cannot
- * handle anyway (long double, vector types).
- *
- * Also, if a compound type is stored in two different register
- * classes, we only return one of them, which is enough for the
- * purposes of this module.
- */
-static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
+static amd64_class classify_slice_for_amd64(ir_type *tp, unsigned min, unsigned max)
 {
 	switch(get_type_tpop_code(tp)) {
 	case tpo_class:
@@ -205,130 +197,26 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 		 * sect. 3.2.3). */
 		panic("classes not supported");
 
-	case tpo_struct: {
-		/* Rules for structs:
-		 * - No unaligned fields
-		 * - smaller than two eightbytes
-		 * - Enough free registers
-		 */
-		if (has_unaligned_fields(tp)) {
-			return class_memory;
-		}
-
-		unsigned        size  = get_type_size_bytes(tp);
-		amd64_abi_state reset = *s;
-		if (size <= 8) {
-			amd64_class c = get_eightbyte_class(s, tp, 0);
-			if (c == class_memory) {
-				*s = reset;
-			}
-			return c;
-		} else if (size <= 16) {
-			amd64_class c1 = get_eightbyte_class(s, tp, 0);
-			amd64_class c2 = get_eightbyte_class(s, tp, 8);
-			if (c1 == class_memory || c2 == class_memory) {
-				*s = reset;
-				return class_memory;
-			} else {
-				/* Arbitrary choice */
-				return c1;
-			}
-		} else {
-			*s = reset;
-			return class_memory;
-		}
-	}
-
-	case tpo_union: {
-		/* Rules for unions:
-		 * - No unaligned fields
-		 * - All members have register class
-		 * - Enough free registers for the largest member (in each register class)
-		 */
-		if (has_unaligned_fields(tp)) {
-			return class_memory;
-		}
-
-		unsigned        n         = get_compound_n_members(tp);
-		amd64_abi_state max_state = *s;
-		bool            is_sse    = true;
-
-		for (unsigned i = 0; i < n; i++) {
-			ir_entity       *member      = get_compound_member(tp, i);
-			ir_type         *member_type = get_entity_type(member);
-			amd64_abi_state  reset       = *s;
-			amd64_class      class       = classify_compound_for_amd64(s, member_type);
-
-			if (class == class_memory) {
-				*s = reset;
-				return class_memory;
-			}
-			if (class != class_sse) {
-				is_sse = false;
-			}
-
-			max_state.integer_params = MAX(max_state.integer_params, s->integer_params);
-			max_state.sse_params     = MAX(max_state.sse_params,     s->sse_params);
-			/* Reset registers for the next member */
-			*s = reset;
-		}
-		*s = max_state;
-
-		return is_sse ? class_sse : class_integer;
-	}
+	case tpo_struct:
+	case tpo_union:
+		return classify_compound_by_members(tp, min, max);
 
 	case tpo_array: {
-		/* Rules for arrays:
-		 * - No unaligned fields
-		 * - smaller than 2 eightbytes
-		 * - Element type has register class
-		 * - Enough free registers
-		 */
-		if (has_unaligned_fields(tp)) {
-			return class_memory;
-		}
-
-		ir_type  *elem_type = get_array_element_type(tp);
-		unsigned  elem_size = get_type_size_bytes(elem_type);
-		unsigned  arr_size  = get_array_size_int(tp);
-		unsigned  n_bytes   = elem_size * arr_size;
-
-		if (n_bytes > 16) {
-			return class_memory;
-		}
-
-		amd64_abi_state  reset  = *s;
-		unsigned         n_regs = (n_bytes + 7) / 8;
-		bool             is_sse = classify_compound_for_amd64(s, elem_type) == class_sse;
-		unsigned        *r;
-		unsigned         max;
-
-		/* Reset registers because we are going to count them ourselves */
-		*s = reset;
-
-		if (is_sse) {
-			r   = &s->sse_params;
-			max = max_sse_params;
-		} else {
-			r   = &s->integer_params;
-			max = max_integer_params;
-		}
-
-		for (unsigned i = 0; i < n_regs; i++) {
-			if (!try_free_register(r, max)) {
-				*s = reset;
-				return class_memory;
-			}
-		}
-
-		return is_sse ? class_sse : class_integer;
+		ir_type *elem_type = get_array_element_type(tp);
+		return classify_slice_for_amd64(elem_type, min, max);
 	}
+	case tpo_primitive: {
+		ir_mode *mode_long_double = get_type_mode(be_get_backend_param()->type_long_double);
+		ir_mode *mode = get_type_mode(tp);
 
-	case tpo_primitive:
-		if (get_mode_sort(get_type_mode(tp)) & irms_float_number) {
+		if (mode == mode_long_double) {
+			return class_x87;
+		} else if (mode_is_float(mode)) {
 			return class_sse;
+		} else {
+			return class_integer;
 		}
-		/* Fallthrough */
+	}
 	case tpo_pointer:
 		return class_integer;
 
@@ -341,44 +229,43 @@ static amd64_class classify_compound_for_amd64(amd64_abi_state *s, ir_type *tp)
 	panic("invalid type");
 }
 
-static amd64_class classify_for_amd64(amd64_abi_state *s, ir_type *tp)
+static void classify_for_amd64(amd64_abi_state *s, ir_type *tp, amd64_class classes[static 2])
 {
-	switch(get_type_tpop_code(tp)) {
-	case tpo_class:
-		/* Classes are not quite like structs. We need to
-		 * check whether the class "has either a non-trivial
-		 * copy constructor or a non-trivial destructor" (ABI
-		 * sect. 3.2.3). */
-		panic("classes not supported");
+	amd64_abi_state reset = *s;
 
-	case tpo_struct:
-	case tpo_union:
-	case tpo_array:
-		return classify_compound_for_amd64(s, tp);
-
-	case tpo_primitive:
-		if (get_mode_sort(get_type_mode(tp)) & irms_float_number) {
-			if (try_free_register(&s->sse_params, max_sse_params)) {
-				return class_sse;
-			} else {
-				return class_memory;
+	if (get_type_size_bytes(tp) > 2 * 8) {
+		goto use_class_memory;
+	} else {
+		for (unsigned i = 0; i < 2; i++) {
+			amd64_class c = classify_slice_for_amd64(tp, 8 * i, 8 * (i + 1));
+			switch (c) {
+			case class_no_class:
+				/* Nothing to do */
+				break;
+			case class_integer:
+				if (!try_free_register(&s->integer_params, max_integer_params)) {
+					goto use_class_memory;
+				}
+				break;
+			case class_sse:
+				if (!try_free_register(&s->sse_params, max_sse_params)) {
+					goto use_class_memory;
+				}
+				break;
+			case class_x87:
+			case class_memory:
+				goto use_class_memory;
 			}
+			classes[i] = c;
 		}
-		/* Fallthrough */
-	case tpo_pointer:
-		if (try_free_register(&s->integer_params, max_integer_params)) {
-			return class_integer;
-		} else {
-			return class_memory;
-		}
-
-	case tpo_uninitialized:
-	case tpo_method:
-	case tpo_code:
-	case tpo_unknown:
-		break;
+		return;
 	}
-	panic("invalid type");
+
+use_class_memory:
+	classes[0] = class_memory;
+	classes[1] = class_no_class;
+	*s = reset;
+	return;
 }
 
 static void panic_if_amd64_register_type(compound_call_lowering_flags flags, ir_type *tp)
@@ -389,12 +276,14 @@ static void panic_if_amd64_register_type(compound_call_lowering_flags flags, ir_
 			.sse_params = 0,
 			.integer_params = 0,
 		};
+		amd64_class classes[2];
+		classify_for_amd64(&s, tp, classes);
 
-		amd64_class c = classify_for_amd64(&s, tp);
+		ir_printf("Classification for %+F: %s %s\n", tp, class_name(classes[0]), class_name(classes[1]));
 
-		if (c == class_integer || c == class_sse) {
-			panic("Small struct return values and parameters not supported");
-		}
+		/* if (classes[0] == class_integer || classes[0] == class_sse) { */
+			/* panic("Small struct return values and parameters not supported"); */
+		/* } */
 	}
 }
 
