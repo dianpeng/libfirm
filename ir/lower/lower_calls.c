@@ -226,7 +226,11 @@ static amd64_class classify_slice_for_amd64(ir_type *tp, unsigned min, unsigned 
 		}
 	}
 	case tpo_pointer:
-		return class_integer;
+		if (min >= get_type_size_bytes(tp)) {
+			return class_no_class;
+		} else {
+			return class_integer;
+		}
 
 	case tpo_uninitialized:
 	case tpo_method:
